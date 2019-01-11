@@ -4,6 +4,7 @@ import sys
 import os
 import config
 import copy
+import pandas as pd
 
 class ImageMaker(object):
     """A class to make pngs with particular shapes that have different fills. This is primarily to generate
@@ -19,35 +20,80 @@ class ImageMaker(object):
         # add this one separately to do backgrounds
         self.bg_rect_maker = RectMakerCorners()
         # puts patterns n the form to be added as strings
-        self.patterns = {pi:('url(#' + p.attrib['id'] + ')') for pi,p in enumerate(self.pattern_root.find('{'
-                                                                      'http://www.w3.org/2000/svg}defs').getchildren())}
-    def make_1shape_image(self, image_file_root, mask_file_root=None, bg_pattern=None, obj_pattern=None,
-                          obj_shape=None, obj_props=None):
-        """Makes an image at the save location in which a patterned shape is added to a patterned location"""
-        if bg_pattern is None:
-            bg_pattern = self.random_pattern()
-        if obj_pattern is None:
-            obj_pattern = self.random_pattern()
-        if obj_shape is None:
-            obj_shape = self.random_obj_shape()
-        if obj_props is None:
-            obj_props = self.shapes[obj_shape].random_props()
+        self.patterns = [('url(#' + p.attrib['id'] + ')') for p in self.pattern_root.find('{'
+                                                                      'http://www.w3.org/2000/svg}defs').getchildren()]
 
-        def make_2_shape_image_sub(bg_fill, obj_fill,file_name):
+    def make_1shape_image_set(self, N, save_location, start_n = 1, image_name_root='image_',
+                              mask_name_root='mask_', data_file_name='image_data_file.csv',
+                              pattern_save_name = 'original_pattern.svg'):
+        """make N single shape images and store them at a specfied location"""
+        """CAVEAT: currently all allowed shapes have to return the same number of parameters when generating a random 
+        parameter set."""
+        num_digits = (np.floor(np.log10(N+start_n))).astype(int)
+        digit_string = '%0{:d}d'.format(num_digits) # string that will be used to add the numbers to the filename
+        image_name_pattern = os.path.join(save_location, image_name_root + digit_string)
+        if mask_name_root is not None:
+            mask_name_pattern = os.path.join(save_location, mask_name_root + digit_string)
+        else:
+            mask_name_pattern = None
+
+        image_properties = self.random_1shape_config()
+        column_names = list(image_properties.keys())
+        data_array = pd.DataFrame(data=np.zeros((N,len(column_names))),columns=column_names)
+
+        for imagei in range(N):
+            image_name = image_name_pattern % (imagei+start_n)
+            if mask_name_root is not None:
+                mask_name = mask_name_pattern % (imagei+start_n)
+            else:
+                mask_name = None
+            image_properties = self.make_1shape_image(image_file_root=image_name,mask_file_root=mask_name)
+            #write to data array
+            data_array.iloc[imagei,:] = [image_properties[k] for k in column_names]
+
+        if data_file_name is not None:
+            data_array.to_csv(os.path.join(save_location,data_file_name),index=False)
+            # leave out index. Find having the index leads to confusion
+        if pattern_save_name is not None:
+            self.pattern_tree.write(os.path.join(save_location,pattern_save_name))
+
+
+
+    def make_1shape_image(self, image_file_root, mask_file_root=None, **kwargs):
+        """Makes an image at the save location in which a patterned shape is added to a patterned location"""
+        image_properties = self.random_1shape_config()
+        # replace any random kwargs with given arguments
+        for k,x in kwargs:
+            image_properties[k] = x
+
+        obj_shape = self.shapes[image_properties['obj_shape_index']]
+        obj_pattern = self.patterns[image_properties['obj_pattern_index']]
+        bg_pattern = self.patterns[image_properties['bg_pattern_index']]
+
+        def make_1_shape_image_sub(bg_fill, obj_fill,file_name):
             new_tree = copy.deepcopy(self.pattern_tree)
             root = new_tree.getroot()
             layer1 = next(element for element in root.getchildren()
                           if (element.tag == '{http://www.w3.org/2000/svg}g' and element.attrib['id'] == 'layer1'))
             layer2 = next(element for element in root.getchildren()
                           if (element.tag == '{http://www.w3.org/2000/svg}g' and element.attrib['id'] == 'layer2'))
+            # add background
             self.bg_rect_maker.add_shape(layer2, x0=0,y0=0,
                                          width=config.bg_size[0],height=config.bg_size[1],
-                                         fill='white')  #add background
+                                         fill='white')
             self.bg_rect_maker.add_shape(layer2, x0=0, y0=0,
                                          width=config.bg_size[0], height=config.bg_size[1],
                                          fill=bg_fill)
-            self.shapes[obj_shape].add_shape(layer1, fill= 'white', **obj_props) # add background
-            self.shapes[obj_shape].add_shape(layer1, fill= obj_fill, **obj_props)
+            # add background
+            obj_shape.add_shape(layer1, fill= 'white',
+                                             **{k:v for k,v in image_properties.items() if k not in
+                                                ['obj_shape_index','obj_pattern_index','bg_pattern_index']}
+                                             ) # logic of above is that all properties other than these in the config
+                                             # are for the shape.
+            obj_shape.add_shape(layer1, fill= obj_fill,
+                                             **{k:v for k,v in image_properties.items() if k not in
+                                                ['obj_shape_index','obj_pattern_index','bg_pattern_index']}
+                                             )
             svg_loc = file_name + '.svg'
             png_loc = file_name + '.png'
             new_tree.write(svg_loc)
@@ -57,17 +103,35 @@ class ImageMaker(object):
             # out the background rectangle and requesting coordinates as:
             #        x = os.system("inkscape -z %s -I object_id -X "%(svg_loc))
             # etc.
-            os.system("inkscape -z %s -w %d -h %d -D -e %s"%(svg_loc,config.im_size[0],config.im_size[1],png_loc))
-        make_2_shape_image_sub(bg_pattern, obj_pattern, image_file_root)
+            os.system("%s -z %s -w %d -h %d -D -e %s"%(self.inkscape_command,svg_loc,
+                                                       config.im_size[0],config.im_size[1],png_loc))
+        make_1_shape_image_sub(bg_pattern, obj_pattern, image_file_root)
         if mask_file_root is not None:
-            make_2_shape_image_sub('black', 'white', mask_file_root)
+            make_1_shape_image_sub('black', 'white', mask_file_root)
+        return image_properties
+
+    def random_1shape_config(self):
+        """randomly generate everything needed for making a 1 shape image"""
+        """NOTE: when changing this method the fields in the returned dictionary should match those parameters 
+        passed to make_1_shape_image method"""
+        image_config = {}
+        shape_index = self.random_obj_shape()
+        image_config['obj_shape_index'] = shape_index
+        image_config['obj_pattern_index'] = self.random_pattern()
+        image_config['bg_pattern_index'] = self.random_pattern()
+
+        obj_props = self.shapes[shape_index].random_props()
+        for k,v in obj_props.items():
+            image_config[k] = v
+
+        return image_config
 
     def random_pattern(self):
-        """Returns a random pattern key from those available"""
-        return np.random.choice([x for x in self.patterns.values()])
+        """Returns a random pattern index from those available"""
+        return np.random.randint(len(self.patterns))
 
     def random_obj_shape(self):
-        """Returns a random pattern key from those available"""
+        """Returns a random shape index from those available"""
         return np.random.randint(len(self.shapes))
 
 
@@ -161,5 +225,14 @@ def rand_range(shape,low=0,high=1):
     return np.random.random(shape)*(high-low) + low
 
 if __name__ == "__main__":
+    # tests written for my computer but you see how they work
+
+    # make image maker
     image_maker_1 = ImageMaker()
-    image_maker_1.make_1shape_image(image_file_root='test_images/image_1',mask_file_root='test_images/mask_1')
+
+    #make image pair
+    image_maker_1.make_1shape_image(image_file_root='test_images/image_1',
+                                    mask_file_root='test_images/mask_1')
+
+    #make set of 100 images
+    image_maker_1.make_1shape_image_set(10,'test_image_set')
